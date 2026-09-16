@@ -1,0 +1,49 @@
+# Floors below match the versions this course was last verified against.
+
+# Core OpenAI packages
+# The realtime extra installs the WebSocket support GPT-Live needs
+# (client.live, used by 02-05-10). GPT-Live requires openai 3.x.
+openai[realtime]>=3.13
+# openai-agents is 0.x, where a MINOR bump may break the API. The upper bound
+# keeps students on the release the Part 2 notebooks were written for. Raise
+# both numbers together after re-running the 02-* notebooks.
+# openai-agents 0.22 requires openai>=3.0,<4.
+# The [litellm] extra is omitted: every current LiteLLM release requires
+# openai<3, which conflicts with openai 3.x. 02-05-09 (LiteLLM) uses the
+# separate deitel-openai-litellm environment: see requirements-litellm.txt.
+openai-agents>=0.22,<0.23
+
+# Agent tools and MCP
+# mcp 2.0 renamed FastMCP to MCPServer. 02-05-06 writes a server that must use
+# the 2.x import; pin <2 only if reverting that notebook.
+mcp>=2.1
+yfinance>=1.7
+playwright>=1.61
+pydantic>=2.13
+
+# Data science, visualization and analysis support
+numpy>=2.5
+pandas>=3.0
+scipy>=1.18
+scikit-learn>=1.9
+statsmodels>=0.15
+matplotlib>=3.11
+seaborn>=0.13
+plotly>=7.0
+openpyxl>=3.1
+pillow>=12.3
+wordcloud>=1.9
+graphviz>=0.21
+requests>=2.34
+beautifulsoup4>=4.15
+lxml>=6.1
+spacy>=3.8
+nltk>=3.10
+
+# Microphone and speaker audio (02-05-10 GPT-Live voice demo)
+sounddevice>=0.5.6
+
+# Development and testing
+jupyterlab>=4.6
+ipykernel>=7.3
+pytest>=9.1

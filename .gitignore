@@ -1,0 +1,15 @@
+.DS_Store
+agent_workflow.png.png
+.ipynb_checkpoints/
+__pycache__/
+unused/
+notebook-suggestions.md
+resources/outputs/
+books.db
+sqlite_mcp_server.py
+
+# Personal note notebooks at the repository root.
+/*.ipynb
+!/[0-9]*.ipynb
+.venv/
+.venv-litellm/

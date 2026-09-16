@@ -1,0 +1,18 @@
+name: deitel-openai-litellm
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.14
+  - jupyterlab>=4.6
+  - ipykernel>=7.3
+  - pip
+  - pip:
+    # Separate environment for 02-05-09 (LiteLLM + Ollama) only.
+    # Every current LiteLLM release requires openai<3, and openai-agents 0.21+
+    # requires openai>=3, so LiteLLM cannot live in the main course
+    # environment. openai-agents 0.20 is the newest release that accepts
+    # openai 2.x. Raise these together only after re-running 02-05-09.
+    - "openai>=2.54,<3"
+    - "openai-agents[litellm]>=0.20,<0.21"
+    - "litellm>=1.83"
