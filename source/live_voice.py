@@ -20,6 +20,18 @@ GPT-Live splits a voice application into two parts:
   runs. In the notebook it is the book concierge's triage agent, with its
   handoffs, ``FileSearchTool`` and ``WebSearchTool``.
 
+THE PROTOCOL IN ONE PARAGRAPH
+-----------------------------
+The application and GPT-Live exchange JSON *events* over one WebSocket.
+The application sends *client events* (start the session, append microphone
+audio, append text, mute, close) and receives *server events* (transcripts,
+audio, delegation requests, usage, ...). Every event has a ``type`` string
+such as ``'session.input_audio.append'`` or ``'session.delegation.created'``.
+The OpenAI Python SDK wraps sending in methods such as
+``connection.session.input_audio.append(...)``, and delivers server events
+as typed objects when you iterate ``async for event in connection``. The SDK
+also reconnects automatically if the WebSocket drops briefly.
+
 HOW THE PIECES IN THIS FILE FIT TOGETHER
 ----------------------------------------
 The notebook supplies two things: the *prompts* (the session configuration)
@@ -28,25 +40,18 @@ and the *backend function*. This module owns all the plumbing:
 1. ``run_live_voice_agent`` — the entry point. Opens the WebSocket session,
    starts the microphone and speaker, waits for the session to end, and
    closes everything gracefully.
-2. ``LiveVoiceAgent`` — the event handler. GPT-Live sends a stream of
-   *server events* over the WebSocket (transcripts, audio, delegation
-   requests, usage, ...). This class reacts to each one.
-3. ``ConversationLog`` — keeps the transcript fragments GPT-Live sends, so
-   the application can build a text request for the backend. (A delegation
-   event carries *no request text*; the transcript is the only source.)
-4. ``SpeakerPlayback`` and ``stream_microphone`` — the audio devices.
+2. ``LiveVoiceAgent`` — the event handler. Reacts to each server event and
+   runs the backend whenever GPT-Live delegates work.
+3. ``Conversation`` — turns GPT-Live's transcript fragments into whole
+   speaker turns using the SDK's ``AsyncTranscriptGrouper``. The turns are
+   used both for on-screen captions and to build the backend's request (a
+   delegation event carries *no request text*; the transcript is the only
+   source).
+4. ``SpeakerPlayback``, ``stream_microphone`` and ``guard_against_echo`` —
+   the audio devices and the optional loudspeaker echo guard.
 5. ``DelegationRequest`` — the small data object handed to the backend.
 
-The GPT-Live protocol, in one paragraph: the application sends *client
-events* (start the session, append microphone audio, append text to the
-session, close) and receives *server events*. Every client event and server
-event is a plain object with a ``type`` string such as
-``'session.input_audio.append'`` or ``'session.delegation.created'``. The
-OpenAI Python SDK wraps sending in methods like
-``connection.session.input_audio.append(...)`` and delivers server events by
-iterating ``async for event in connection``.
-
-Requires openai>=3.13 (installed with the ``realtime`` extra, which adds the
+Requires openai>=3.42 (installed with the ``realtime`` extra, which adds the
 ``websockets`` package) and sounddevice for microphone and speaker audio.
 """
 
@@ -64,6 +69,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from openai import AsyncOpenAI
+from openai.lib.live import AsyncTranscriptGrouper, TranscriptSegment
+from openai.resources.live.live import AsyncLiveConnection
+from openai.types.live.server_event import ServerEvent
+from openai.types.live.session_config_param import SessionConfigParam
 
 # ----------------------------------------------------------------------- #
 # Constants                                                               #
@@ -81,7 +90,7 @@ BYTES_PER_SECOND = SAMPLE_RATE * 2  # 16-bit samples are 2 bytes each
 MICROPHONE_BLOCK_SECONDS = 0.1
 
 # GPT-Live limits each thinking/commentary/instructions append to 500 tokens.
-# There is no tokenizer dependency here, so a conservative character cap is
+# Rather than add a tokenizer dependency, a conservative character cap is
 # used instead (about 3 characters per token, with headroom).
 MAX_APPEND_CHARACTERS = 1_500
 
@@ -89,10 +98,13 @@ MAX_APPEND_CHARACTERS = 1_500
 # and tool usage is billed separately by the Responses API.
 VOICE_DOLLARS_PER_MINUTE = 0.05
 
-# When echo_guard is on (room-speaker demos), keep sending silence for this
-# long after local playback should have finished, so the tail of the room's
-# echo is not sent back to GPT-Live as if the user had spoken.
+# When the echo guard is on (room-speaker demos), keep the session muted for
+# this long after local playback should have finished, so the tail of the
+# room's echo is not heard by GPT-Live as if the user had spoken.
 ECHO_TAIL_SECONDS = 0.3
+
+# How often the echo guard checks whether the concierge is still talking.
+ECHO_CHECK_SECONDS = 0.05
 
 
 # ----------------------------------------------------------------------- #
@@ -150,7 +162,8 @@ class LiveSessionSummary:
 
     Attributes:
         session_id: GPT-Live's ID for the session (from ``session.started``).
-        close_reason: Why the session ended (from ``session.closed``).
+        close_reason: Why the session ended (from ``session.closed``), such
+            as ``close_requested`` or ``expired``.
         voice_seconds: Total billable voice seconds GPT-Live reported.
         delegations: How many client delegations GPT-Live requested.
         finalized: True if GPT-Live sent ``session.closed``, meaning the
@@ -175,92 +188,100 @@ class LiveSessionSummary:
 # Transcript handling                                                     #
 # ----------------------------------------------------------------------- #
 
-@dataclass
-class _Fragment:
-    """One piece of transcript text exactly as GPT-Live delivered it."""
-
-    speaker: str  # 'user' or 'assistant'
-    text: str
-    start_ms: int  # position on the session timeline, for ordering
-
-
-class ConversationLog:
-    """Transcript fragments, preserved exactly as GPT-Live sends them.
+class Conversation:
+    """Whole speaker turns built from GPT-Live's transcript fragments.
 
     GPT-Live transcribes BOTH speakers and streams the text as small
     fragments (``session.input_transcript.delta`` for the user and
-    ``session.output_transcript.delta`` for the assistant). Three things
-    make this trickier than it sounds, and this class handles all three:
+    ``session.output_transcript.delta`` for the assistant). A fragment is
+    not a whole turn, and there is no "turn completed" event, so the
+    application must decide how fragments group into turns.
 
-    * There is no "turn completed" event, and a fragment is not a whole
-      turn. So fragments are stored as-is and stitched together later.
-    * Fragments can arrive slightly out of order. Each carries a
-      ``start_ms`` timestamp on the session timeline, so they are sorted by
-      that rather than by arrival time.
-    * OpenAI's guidance is to concatenate fragments *without* trimming or
-      inserting spaces: the fragments already contain the right spacing.
+    The OpenAI SDK ships a helper for exactly this job:
+    ``openai.lib.live.AsyncTranscriptGrouper``. Push every server event into
+    it and it calls back with *segments*:
 
-    The log also remembers when the user last said something
-    (``last_user_update``) so a delegation can wait briefly for the user's
-    sentence to finish transcribing before the backend runs.
-    """
+    * ``segment.updated`` — the latest snapshot of a turn in progress. Each
+      snapshot REPLACES the previous one with the same ``id``; the text only
+      ever grows.
+    * ``segment.closed`` — the turn is finished (the other speaker started,
+      the assistant went quiet, or the session closed).
 
-    def __init__(self) -> None:
-        self._fragments: list[_Fragment] = []
-        self.last_user_update = 0.0  # time.monotonic() of latest user text
+    The grouper orders fragments by their timestamps on the session timeline
+    (not by arrival time), joins them without adding or trimming spaces, and
+    drops brief acknowledgments such as "mm-hmm" from the *listening* speaker
+    so they don't break the other speaker's turn in two.
 
-    def add(self, speaker: str, text: str, start_ms: int) -> None:
-        """Store one fragment; note the time if the user spoke."""
-        self._fragments.append(_Fragment(speaker, text, start_ms))
-        if speaker == 'user':
-            self.last_user_update = time.monotonic()
+    This class keeps the latest snapshot of every segment, prints captions
+    as the snapshots grow, and builds the role-labeled text the backend
+    receives.
 
-    def recent(self, max_characters: int = 4_000) -> str:
-        """Role-labeled recent conversation for a backend request.
-
-        Fragments are sorted by ``start_ms``, consecutive fragments from the
-        same speaker are joined into one line, and each line is labeled
-        "User:" or "Assistant:". Only the last ``max_characters`` are
-        returned so long sessions do not flood the backend's prompt.
-        """
-        lines: list[list[str]] = []  # [speaker, text] rows
-        for fragment in sorted(self._fragments, key=lambda f: f.start_ms):
-            if lines and lines[-1][0] == fragment.speaker:
-                lines[-1][1] += fragment.text  # same speaker: extend the line
-            else:
-                lines.append([fragment.speaker, fragment.text])
-
-        labels = {'user': 'User', 'assistant': 'Assistant'}
-        text = '\n'.join(f'{labels[s]}: {t}' for s, t in lines)
-        return text[-max_characters:]
-
-    def recent_user_text(self, max_characters: int = 120) -> str:
-        """The last few characters the user said, for end-phrase detection."""
-        user = ''.join(
-            f.text for f in sorted(self._fragments, key=lambda f: f.start_ms)
-            if f.speaker == 'user'
-        )
-        return user[-max_characters:]
-
-
-class CaptionPrinter:
-    """Prints live captions and a separate status line for backend activity.
-
-    Captions stream in as fragments, so this prints text without newlines
-    and only starts a new line (with a label) when the speaker changes.
+    Args:
+        on_user_update: Optional function called with the text of the
+            user's turn every time it grows (used to spot "goodbye").
     """
 
     LABELS = {'user': 'You', 'assistant': 'Concierge'}
 
-    def __init__(self) -> None:
-        self._current: str | None = None  # speaker of the line in progress
+    def __init__(
+        self, on_user_update: Callable[[str], None] | None = None
+    ) -> None:
+        self.on_user_update = on_user_update
+        self.grouper = AsyncTranscriptGrouper()
+        self.grouper.on('segment.updated', self._on_segment_updated)
 
-    def write(self, speaker: str, text: str) -> None:
-        """Append caption text, starting a new labeled line on speaker change."""
-        if speaker != self._current:
-            print(f'\n{self.LABELS[speaker]}: ', end='', flush=True)
-            self._current = speaker
-        print(text, end='', flush=True)
+        # Latest snapshot of each segment, keyed by segment ID. Python dicts
+        # keep insertion order, which is the order the turns started in.
+        self._segments: dict[str, TranscriptSegment] = {}
+
+        # Caption state: which segment the current caption line belongs to,
+        # and how much of each segment's text has already been printed.
+        self._caption_segment: str | None = None
+        self._printed: dict[str, int] = {}
+
+        # time.monotonic() of the user's most recent words. A delegation
+        # waits until the user has been quiet briefly (see LiveVoiceAgent).
+        self.last_user_update = 0.0
+
+    async def push(self, event: ServerEvent) -> None:
+        """Feed one server event to the grouper (it ignores unrelated events)."""
+        await self.grouper.push(event)
+
+    async def close(self) -> None:
+        """Finish the open segments and stop the grouper's timers."""
+        await self.grouper.close()
+
+    def _on_segment_updated(self, segment: TranscriptSegment) -> None:
+        """Store the newest snapshot and print the caption text it adds."""
+        self._segments[segment.id] = segment
+        self._print_caption(segment)
+        if segment.speaker == 'user':
+            self.last_user_update = time.monotonic()
+            if self.on_user_update is not None:
+                self.on_user_update(segment.text)
+
+    def _print_caption(self, segment: TranscriptSegment) -> None:
+        """Print only the text this snapshot adds to its segment.
+
+        Captions stream in place: text is printed without newlines, and a
+        new labeled line starts only when a different segment grows. (When
+        both people talk at once, lines alternate between the two speakers.)
+        """
+        already_printed = self._printed.get(segment.id, 0)
+        new_text = segment.text[already_printed:]
+        if not new_text:
+            return
+
+        if segment.id != self._caption_segment:
+            # A different segment is growing: start a fresh labeled line.
+            # "…" marks a line that continues a segment printed earlier.
+            continuing = '…' if already_printed else ''
+            print(f'\n{self.LABELS[segment.speaker]}: {continuing}',
+                  end='', flush=True)
+            self._caption_segment = segment.id
+
+        print(new_text, end='', flush=True)
+        self._printed[segment.id] = len(segment.text)
 
     def status(self, text: str) -> None:
         """Print a bracketed status line outside the captions.
@@ -270,7 +291,22 @@ class CaptionPrinter:
         GPT-Live decides when (and how) to say it.
         """
         print(f'\n    [{text}]', flush=True)
-        self._current = None  # force a fresh label on the next caption
+        self._caption_segment = None  # force a fresh label on the next caption
+
+    def recent(self, max_characters: int = 4_000) -> str:
+        """Role-labeled recent conversation for a backend request.
+
+        Each segment becomes one "User: ..." or "Assistant: ..." line, in the
+        order the turns started. Only the last ``max_characters`` are
+        returned so long sessions don't flood the backend's prompt.
+        """
+        labels = {'user': 'User', 'assistant': 'Assistant'}
+        ordered = sorted(self._segments.values(), key=lambda s: s.start_ms)
+        text = '\n'.join(
+            f'{labels[s.speaker]}: {s.text.strip()}' for s in ordered
+        )
+        return text[-max_characters:]
+
 
 
 def cap_append(text: str) -> str:
@@ -308,13 +344,13 @@ class LiveVoiceAgent:
     can be tested without a microphone or speakers.
 
     Args:
-        connection: The SDK's live connection object (from
-            ``client.live.connect()``). Used both to iterate server events
-            and to send client events via ``connection.session.*``.
+        connection: The SDK's live connection (from ``client.live.connect()``).
+            Used both to iterate server events and to send client events via
+            ``connection.session.*``.
         backend: The notebook's async backend function (see ``Backend``).
         play_audio: Callable that receives raw PCM16 bytes to play.
-        settle_seconds: How long the user's transcript must be quiet before
-            a delegation's request text is considered complete.
+        settle_seconds: How long the user must be quiet before a
+            delegation's request text is considered complete.
         max_settle_seconds: Upper bound on that wait, so a backend run is
             never delayed indefinitely by a chatty user.
         end_phrases: Spoken phrases (e.g. "goodbye") that end the session.
@@ -322,7 +358,7 @@ class LiveVoiceAgent:
 
     def __init__(
         self,
-        connection: Any,
+        connection: AsyncLiveConnection,
         backend: Backend,
         *,
         play_audio: Callable[[bytes], None] | None = None,
@@ -337,8 +373,10 @@ class LiveVoiceAgent:
         self.max_settle_seconds = max_settle_seconds
         self.end_phrases = tuple(_normalize(p) for p in end_phrases)
 
-        self.conversation = ConversationLog()
-        self.captions = CaptionPrinter()
+        # The grouper may hold back the user's words briefly (for example,
+        # while the concierge is still talking), so the end-phrase check
+        # runs whenever the user's turn grows, not on each raw fragment.
+        self.conversation = Conversation(on_user_update=self._check_end_phrase)
         self.summary = LiveSessionSummary()
 
         # asyncio.Event objects let run_live_voice_agent wait for milestones
@@ -362,41 +400,38 @@ class LiveVoiceAgent:
     async def receive_events(self) -> None:
         """Read server events until GPT-Live finalizes the session.
 
-        ``async for event in self.connection`` yields one server event at a
-        time as the SDK receives it over the WebSocket. The loop ends when
-        ``session.closed`` arrives, which GPT-Live sends after the client
-        closes the session (or after an error or timeout).
+        ``async for event in self.connection`` yields one typed server event
+        at a time as the SDK receives it. (The SDK also offers a callback
+        style — ``connection.on('session.started', handler)`` plus
+        ``await connection.dispatch_events()`` — but one ``match`` statement
+        makes every event this demo handles easy to see in one place.)
+
+        The loop ends when ``session.closed`` arrives, which GPT-Live sends
+        after the client closes the session (or after an error or timeout).
         """
         async for event in self.connection:
             await self.handle_event(event)
             if event.type == 'session.closed':
                 break
 
-    async def handle_event(self, event: Any) -> None:
+    async def handle_event(self, event: ServerEvent) -> None:
         """React to one server event, keyed on its ``type`` string.
 
         Server events not listed here (for example, the ``*.appended``
         acknowledgements GPT-Live sends after each append) are ignored.
         """
+        # Every event also goes to the transcript grouper, which picks out
+        # the transcript fragments (session.input_transcript.delta and
+        # session.output_transcript.delta) and session.closed, and ignores
+        # the rest. Captions and the backend's request text come from it.
+        await self.conversation.push(event)
+
         match event.type:
             case 'session.started':
                 # First event after session.start(). Carries the session
                 # resource, including the ID used for tracing and billing.
                 self.summary.session_id = event.session.id
                 self.started.set()
-
-            case 'session.input_transcript.delta':
-                # A fragment of what the USER said.
-                self.conversation.add('user', event.delta, event.start_ms)
-                self.captions.write('user', event.delta)
-                self._check_end_phrase()
-
-            case 'session.output_transcript.delta':
-                # A fragment of what the ASSISTANT said (or is about to say).
-                self.conversation.add(
-                    'assistant', event.delta, event.start_ms
-                )
-                self.captions.write('assistant', event.delta)
 
             case 'session.output_audio.delta':
                 # A chunk of the assistant's voice, base64-encoded PCM16.
@@ -415,30 +450,34 @@ class LiveVoiceAgent:
                 # the session, not increments, so simply overwrite.
                 self.summary.voice_seconds = event.usage.seconds
 
+            case 'info':
+                # An informational notice about the session (not an error).
+                self.conversation.status(f'info: {event.message}')
+
             case 'error':
-                # Errors do not necessarily end the session (for example, a
-                # rejected append). Report it and keep going; if the session
-                # really did end, session.closed follows.
+                # Errors don't necessarily end the session (for example, a
+                # rejected append). client_event_id names the command that
+                # failed, if the error was caused by one. Report the error
+                # and keep going; if the session really ended, session.closed
+                # follows.
                 error = event.error
-                self.captions.status(
-                    f'error {getattr(error, "code", None)}: '
-                    f'{getattr(error, "message", error)}'
+                source = (f' (from {event.client_event_id})'
+                          if event.client_event_id else '')
+                self.conversation.status(
+                    f'error {error.code}{source}: {error.message}'
                 )
 
             case 'session.closed':
                 # Final event. Carries the close reason and final usage.
                 self.summary.close_reason = event.reason
-                if event.usage is not None:
-                    self.summary.voice_seconds = event.usage.seconds
+                self.summary.voice_seconds = event.usage.seconds
                 self.summary.finalized = True
                 self.closed.set()
 
-    def _check_end_phrase(self) -> None:
-        """Set ``end_requested`` if the user's latest words end with a phrase."""
-        if not self.end_phrases:
-            return
-        recent = _normalize(self.conversation.recent_user_text())
-        if any(recent.endswith(p) for p in self.end_phrases):
+    def _check_end_phrase(self, user_text: str) -> None:
+        """Set ``end_requested`` if the user's turn ends with an end phrase."""
+        latest = _normalize(user_text)
+        if any(latest.endswith(phrase) for phrase in self.end_phrases):
             self.end_requested.set()
 
     # ----------------------------------------------------------------- #
@@ -449,7 +488,7 @@ class LiveVoiceAgent:
         """Claim a delegation and start the backend for it as a task.
 
         Runs the backend as an ``asyncio.Task`` so the event loop keeps
-        receiving audio and transcripts while the agent works. That is what
+        receiving audio and transcripts while the agent works. That's what
         lets GPT-Live keep talking with the user during a lookup.
         """
         # Claim the delegation so a duplicate delivery can't run twice.
@@ -460,7 +499,7 @@ class LiveVoiceAgent:
 
         # A newer delegation supersedes an unfinished one, such as when the
         # user corrects a request ("actually, the Python book"). Book lookups
-        # have no side effects, so it is safe to cancel the older work rather
+        # have no side effects, so it's safe to cancel the older work rather
         # than let it finish and confuse the conversation. GPT-Live is told
         # (quietly, via thinking) that the old request will get no result.
         self._revision += 1
@@ -501,7 +540,7 @@ class LiveVoiceAgent:
             # Quiet progress: sent as *thinking*, which GPT-Live can use to
             # reassure the user ("still looking...") but doesn't read aloud.
             if revision == self._revision:
-                self.captions.status(f'backend: {text}')
+                self.conversation.status(f'backend: {text}')
                 await self._send('thinking', delegation_id, text)
 
         try:
@@ -509,7 +548,7 @@ class LiveVoiceAgent:
         except asyncio.CancelledError:
             raise  # superseded or shutting down: let the cancellation through
         except Exception as error:  # report failures; never invent success
-            self.captions.status(f'backend failed: {error!r}')
+            self.conversation.status(f'backend failed: {error!r}')
             result = (
                 'The book lookup failed, so no answer is available. '
                 'Offer to try again.'
@@ -517,19 +556,19 @@ class LiveVoiceAgent:
 
         # Discard an outdated result instead of announcing it.
         if revision != self._revision:
-            self.captions.status('discarded an outdated backend result')
+            self.conversation.status('discarded an outdated backend result')
             return
 
         # The verified result: sent as *commentary*, which GPT-Live
         # paraphrases aloud in its own voice and style.
-        self.captions.status(f'backend result: {result}')
+        self.conversation.status(f'backend result: {result}')
         await self._send('commentary', delegation_id, result)
 
     async def _wait_for_transcript(self) -> None:
         """Wait until the user's transcript has been quiet for a moment.
 
-        Returns as soon as ``settle_seconds`` have passed since the last user
-        fragment, or after ``max_settle_seconds`` at most.
+        Returns as soon as ``settle_seconds`` have passed since the user's
+        last words, or after ``max_settle_seconds`` at most.
         """
         deadline = time.monotonic() + self.max_settle_seconds
         while time.monotonic() < deadline:
@@ -549,11 +588,11 @@ class LiveVoiceAgent:
 
         * thinking — quiet context GPT-Live may use but does not speak
         * commentary — a result GPT-Live should voice
-        * instructions — a system-level directive (used for the greeting)
+        * instructions — a session-level directive (used for the greeting)
 
         Every append names the delegation it belongs to (``delegation_id``,
-        or ``None`` for session-level instructions) and carries a unique
-        ``event_id`` so acknowledgements and errors can be matched to it.
+        or ``None`` for session-level text) and carries a unique ``event_id``
+        so an error can be matched to the append that caused it.
         """
         if self.closing:
             return  # the session is closing; late appends would be rejected
@@ -579,8 +618,8 @@ def import_sounddevice() -> Any:
     """Import sounddevice with a clear setup message if it is missing.
 
     sounddevice wraps the PortAudio library and gives Python access to the
-    microphone and speakers. It is imported lazily so the rest of this
-    module can be used (and tested) without audio hardware.
+    microphone and speakers. It's imported here, rather than at the top of
+    the file, so the rest of this module can be used without audio hardware.
     """
     try:
         import sounddevice as sd
@@ -600,9 +639,9 @@ class SpeakerPlayback:
     handling and the microphone). Instead, chunks go into a queue and a
     background thread feeds them to the speaker.
 
-    ``playing_until`` is an estimate of when the queued audio will finish
-    playing. The optional echo guard in ``stream_microphone`` uses it to
-    know when the concierge's own voice might be leaking into the mic.
+    ``playing_until`` estimates when the queued audio will finish playing.
+    The optional echo guard uses it to know when the concierge's own voice
+    might be leaking into the microphone.
     """
 
     def __init__(self, sd: Any) -> None:
@@ -620,14 +659,22 @@ class SpeakerPlayback:
         self._thread.start()
 
     def play(self, pcm: bytes) -> None:
-        """Queue a chunk for playback and extend the playing-until estimate."""
-        with self._lock:
-            now = time.monotonic()
-            # If audio is already queued, this chunk starts after it ends.
-            self.playing_until = (
-                max(self.playing_until, now) + len(pcm) / BYTES_PER_SECOND
-            )
+        """Queue a chunk for playback and extend the playing-until estimate.
+
+        GPT-Live streams audio continuously, including silence between
+        sentences, so only audible chunks extend ``playing_until``.
+        """
+        if _is_audible(pcm):
+            with self._lock:
+                now = time.monotonic()
+                queued_until = max(self.playing_until, now)
+                self.playing_until = queued_until + len(pcm) / BYTES_PER_SECOND
         self._queue.put(pcm)
+
+    @property
+    def is_playing(self) -> bool:
+        """True while queued speech (plus a short echo tail) is still playing."""
+        return time.monotonic() < self.playing_until + ECHO_TAIL_SECONDS
 
     def _run(self) -> None:
         """Playback thread: write chunks until a None sentinel arrives."""
@@ -642,13 +689,18 @@ class SpeakerPlayback:
         self._stream.close()
 
 
+def _is_audible(pcm: bytes, threshold: int = 500) -> bool:
+    """True if a PCM16 chunk contains more than near-silence.
+
+    ``memoryview(...).cast('h')`` views the bytes as signed 16-bit samples
+    without copying them; every 8th sample is enough to detect speech.
+    """
+    samples = memoryview(pcm).cast('h')
+    return any(abs(sample) > threshold for sample in samples[::8])
+
+
 async def stream_microphone(
-    sd: Any,
-    connection: Any,
-    stop: asyncio.Event,
-    *,
-    speaker: SpeakerPlayback | None = None,
-    echo_guard: bool = False,
+    sd: Any, connection: AsyncLiveConnection, stop: asyncio.Event
 ) -> None:
     """Send microphone audio to GPT-Live until ``stop`` is set.
 
@@ -657,18 +709,10 @@ async def stream_microphone(
     detection), so nothing here tries to detect speech.
 
     The sounddevice input stream calls ``callback`` on its own audio thread
-    for every block of samples. The callback cannot ``await``, so it hands
+    for every block of samples. The callback can't ``await``, so it hands
     the bytes to the asyncio loop with ``call_soon_threadsafe``; the loop
     then base64-encodes each chunk and sends it as a
     ``session.input_audio.append`` client event.
-
-    Args:
-        sd: The imported sounddevice module.
-        connection: The SDK live connection (for ``session.input_audio``).
-        stop: Set by the caller to end streaming.
-        speaker: The playback object, needed only for the echo guard.
-        echo_guard: If True, send silence while the concierge's own voice
-            is playing. Use only with room speakers; see below.
     """
     loop = asyncio.get_running_loop()
     chunks: asyncio.Queue[bytes] = asyncio.Queue()
@@ -693,17 +737,41 @@ async def stream_microphone(
             except TimeoutError:
                 continue  # no audio yet; re-check `stop` and keep waiting
 
-            # Echo guard for loudspeaker demos: replace microphone audio with
-            # silence while the concierge's own voice is playing, so GPT-Live
-            # does not hear itself and interrupt its own answer. This gives
-            # up full-duplex interruptions, so prefer headphones.
-            if (echo_guard and speaker is not None and time.monotonic()
-                    < speaker.playing_until + ECHO_TAIL_SECONDS):
-                chunk = bytes(len(chunk))  # same length, all zeros = silence
-
             await connection.session.input_audio.append(
                 audio=base64.b64encode(chunk).decode('ascii')
             )
+
+
+async def guard_against_echo(
+    connection: AsyncLiveConnection,
+    speaker: SpeakerPlayback,
+    stop: asyncio.Event,
+) -> None:
+    """Mute GPT-Live's input while the concierge's own voice is playing.
+
+    Only for room-speaker demos. Through laptop speakers, the microphone
+    picks up the concierge's voice, GPT-Live hears itself, and it interrupts
+    its own answers. Headphones avoid the problem entirely and keep full
+    duplex, so prefer them.
+
+    ``session.input_audio.mute`` tells GPT-Live to treat input as silence
+    without ending the session; ``session.input_audio.unmute`` resumes
+    listening. GPT-Live acknowledges each with ``session.input_audio.muted``
+    or ``.unmuted``. The cost of muting: the user can't interrupt the
+    concierge while it talks.
+    """
+    muted = False
+    while not stop.is_set():
+        should_mute = speaker.is_playing
+        if should_mute != muted:
+            if should_mute:
+                await connection.session.input_audio.mute(event_id='echo_mute')
+            else:
+                await connection.session.input_audio.unmute(
+                    event_id='echo_unmute'
+                )
+            muted = should_mute
+        await asyncio.sleep(ECHO_CHECK_SECONDS)
 
 
 # ----------------------------------------------------------------------- #
@@ -711,7 +779,7 @@ async def stream_microphone(
 # ----------------------------------------------------------------------- #
 
 async def run_live_voice_agent(
-    session_config: dict[str, Any],
+    session_config: SessionConfigParam,
     backend: Backend,
     *,
     greeting: str | None = None,
@@ -731,8 +799,8 @@ async def run_live_voice_agent(
     4. Send ``session.start`` with the notebook's session configuration
        (model, instructions, audio format, delegation mode) and wait for
        ``session.started``.
-    5. Start streaming the microphone and, optionally, ask GPT-Live to
-       greet the user via ``session.instructions.append``.
+    5. Start streaming the microphone (plus the optional echo guard) and
+       ask GPT-Live to greet the user via ``session.instructions.append``.
     6. Wait until one of these happens: the user says an end phrase, the
        receiver or microphone task stops (error or server close), or
        ``max_minutes`` elapse.
@@ -742,12 +810,13 @@ async def run_live_voice_agent(
     Args:
         session_config: The ``SessionConfigParam`` dict from the notebook.
             The model, instructions, audio settings and delegation mode
-            cannot change after the session starts.
+            can't change after the session starts.
         backend: The notebook's async backend function.
         greeting: Instruction text asking GPT-Live to speak first.
         end_phrases: Spoken phrases that end the session.
         max_minutes: Cost safety cap; the session ends after this long.
-        echo_guard: Send silence while the concierge speaks (room speakers).
+        echo_guard: Mute GPT-Live's input while the concierge speaks
+            (room-speaker demos only; see ``guard_against_echo``).
         close_timeout: How long to wait for ``session.closed`` at shutdown.
 
     Returns:
@@ -756,7 +825,7 @@ async def run_live_voice_agent(
     """
     sd = import_sounddevice()
     speaker = SpeakerPlayback(sd)
-    stop_microphone = asyncio.Event()
+    stop_audio = asyncio.Event()  # tells the microphone and echo guard to stop
 
     async with AsyncOpenAI() as client:
         async with client.live.connect() as connection:
@@ -767,7 +836,7 @@ async def run_live_voice_agent(
 
             # Start receiving before sending commands, so no event is missed.
             receiver = asyncio.create_task(agent.receive_events())
-            microphone: asyncio.Task[None] | None = None
+            audio_tasks: list[asyncio.Task[None]] = []
             speaker.start()
 
             try:
@@ -781,10 +850,13 @@ async def run_live_voice_agent(
                 print('Speak naturally. Say "goodbye" to end, or interrupt '
                       'the kernel.')
 
-                microphone = asyncio.create_task(stream_microphone(
-                    sd, connection, stop_microphone,
-                    speaker=speaker, echo_guard=echo_guard,
+                audio_tasks.append(asyncio.create_task(
+                    stream_microphone(sd, connection, stop_audio)
                 ))
+                if echo_guard:
+                    audio_tasks.append(asyncio.create_task(
+                        guard_against_echo(connection, speaker, stop_audio)
+                    ))
 
                 if greeting:
                     # Ask for a greeting before the user speaks. Instructions
@@ -795,11 +867,11 @@ async def run_live_voice_agent(
                     )
 
                 # Wait for the first of: end phrase, receiver finished
-                # (server closed the session), microphone stopped (device
+                # (server closed the session), an audio task stopped (device
                 # error), or the time limit.
                 ended = asyncio.create_task(agent.end_requested.wait())
                 done, _ = await asyncio.wait(
-                    {ended, receiver, microphone},
+                    {ended, receiver, *audio_tasks},
                     timeout=max_minutes * 60,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -823,8 +895,8 @@ async def run_live_voice_agent(
                 # asyncio.shield keeps a second interrupt from cutting the
                 # graceful close short.
                 await asyncio.shield(_close_gracefully(
-                    connection, agent, receiver, microphone,
-                    stop_microphone, close_timeout,
+                    connection, agent, receiver, audio_tasks,
+                    stop_audio, close_timeout,
                 ))
                 speaker.stop()
 
@@ -833,30 +905,29 @@ async def run_live_voice_agent(
 
 
 async def _close_gracefully(
-    connection: Any,
+    connection: AsyncLiveConnection,
     agent: LiveVoiceAgent,
     receiver: asyncio.Task[None],
-    microphone: asyncio.Task[None] | None,
-    stop_microphone: asyncio.Event,
+    audio_tasks: list[asyncio.Task[None]],
+    stop_audio: asyncio.Event,
     close_timeout: float,
 ) -> None:
     """Close the session and wait for GPT-Live's final usage event.
 
-    Order matters here:
+    Order matters here, following OpenAI's session-closing guidance:
 
-    1. Stop the microphone so no more audio is sent.
+    1. Stop the microphone (and echo guard) so no more audio is sent.
     2. Cancel any backend work still running.
     3. Send ``session.close`` and wait (up to ``close_timeout``) for
        ``session.closed``, which carries the final billable seconds. The
        receiver task is still reading, so that event will be seen.
-    4. Only then cancel the receiver.
+    4. Only then cancel the receiver and finish the transcript grouper.
 
     Skipping step 3 would still end the session on OpenAI's side, but the
     application would never learn the final usage or close reason.
     """
-    stop_microphone.set()
-    if microphone is not None:
-        await asyncio.gather(microphone, return_exceptions=True)
+    stop_audio.set()
+    await asyncio.gather(*audio_tasks, return_exceptions=True)
 
     # Book lookups have no side effects, so cancel unfinished backend work.
     await agent.cancel_delegations()
@@ -872,6 +943,7 @@ async def _close_gracefully(
 
     receiver.cancel()
     await asyncio.gather(receiver, return_exceptions=True)
+    await agent.conversation.close()
 
 
 def _print_summary(summary: LiveSessionSummary) -> None:

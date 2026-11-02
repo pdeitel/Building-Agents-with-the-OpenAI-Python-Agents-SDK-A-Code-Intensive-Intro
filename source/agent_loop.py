@@ -1,7 +1,7 @@
 """agent_loop.py — Importable streaming conversation loop helper.
 
 Usage in any notebook cell:
-    from agent_loop import run_conversation, print_steps
+    from source.agent_loop import run_conversation, print_steps
 
     # Stream only
     await run_conversation('I am a Python tutor. How can I help you?', tutor)

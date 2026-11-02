@@ -1,5 +1,5 @@
 .DS_Store
-agent_workflow.png.png
+agent_workflow.png
 .ipynb_checkpoints/
 __pycache__/
 unused/
@@ -12,4 +12,6 @@ sqlite_mcp_server.py
 /*.ipynb
 !/[0-9]*.ipynb
 .venv/
-.venv-litellm/
+
+# Scratch copies of notebooks (not part of the course)
+temp/

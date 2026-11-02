@@ -16,7 +16,7 @@ Many attendees like to run examples in parallel. If you run into software issues
 
 Complete these steps (discussed below) to run the notebooks locally:
 
-1. Install Anaconda or Python 3.14+.
+1. Install Anaconda or Python 3.14.
 2. Get the course code from GitHub.
 3. Run the setup script from the course folder.
 4. Create and store your OpenAI API key in the `OPENAI_API_KEY` environment variable.
@@ -44,11 +44,12 @@ Recommended:
 
 Alternative:
 
-* Python 3.14+ from [python.org](https://www.python.org/downloads/), Homebrew, `pyenv`, or another Python distribution
+* Python 3.14 (not 3.15 yet — LiteLLM, used by `02-05-09`, doesn't support it) from [python.org](https://www.python.org/downloads/), Homebrew, `pyenv`, or another Python distribution
 
 **Note**  
-* I tested the demos with Python 3.14
-* AI assessments by OpenAI's Codex and Anthropic's Claude Code indicated that most examples should work with Python 3.10 or higher, but **I did not confirm**.
+* I tested the demos with Python 3.14, and the setup scripts require it
+* Python 3.15 is not supported yet because LiteLLM (used by `02-05-09`) requires Python below 3.15
+* The Anaconda setup installs Python 3.14 for you
 
 ### Google Chrome (Computer Tool demo)
 
@@ -90,13 +91,14 @@ All setup commands below must be run from the course's root folder: the folder t
 
 The setup script:
 
-* creates a conda environment named `deitel-openai`
+* creates a conda environment named `deitel-openai-agents` (or updates it if it already exists)
 * installs the OpenAI Python SDK with realtime support for GPT-Live: `openai[realtime]`
 * installs the OpenAI Agents SDK: `openai-agents`
-* installs JupyterLab and registers the `Python (deitel-openai)` kernel
+* installs JupyterLab and registers the `Python (deitel-openai-agents)` kernel
 * installs Graphviz support for Agents SDK workflow visualizations
 * installs Playwright Chromium browser support for the Computer Tool demo (if we have time)
-* installs common data-science, visualization and NLP libraries such as `pandas`, `matplotlib`, `seaborn`, `scikit-learn`, `spacy` and `nltk` 
+* installs `yfinance` (and its `pandas` and `numpy` dependencies) for the financial research demo
+* installs `litellm` for the local-model demo (`02-05-09`)
 * installs `sounddevice` for microphone and speaker audio in the GPT-Live voice demo
 
 ### macOS
@@ -113,35 +115,35 @@ Open **Anaconda Prompt** or **Anaconda PowerShell**, navigate to the course fold
 setup\setup_windows.bat
 ```
 
-### Already have a `deitel-openai` environment?
+### Updating or using a different environment name
 
-If you took my earlier OpenAI course, you already have an environment named `deitel-openai`, and running the setup again would modify it. Pass a different name as the first argument to create a separate environment and kernel:
+Rerun the same script at any time to update `deitel-openai-agents` to the course's current package versions. The default name keeps this course separate from the `deitel-openai` environment used by my earlier OpenAI course. To use a different name, pass it as the first argument:
 
 ```bash
-bash setup/setup_mac.sh deitel-openai-agents
+bash setup/setup_mac.sh my-env-name
 ```
 
 ```bat
-setup\setup_windows.bat deitel-openai-agents
+setup\setup_windows.bat my-env-name
 ```
 
-Then use that name wherever these instructions say `deitel-openai`.
+Then use that name wherever these instructions say `deitel-openai-agents`.
 
 ---
 
 ## Setup — Python/pip Users
 
-**Use these instructions only if you are not using Anaconda. I did not test the pip setups—I simply asked Codex to mimic the Anaconda setups.**
+**Use these instructions only if you are not using Anaconda.** The macOS pip setup has been tested; the Windows pip setup has not.
 
 ### macOS / Linux
 
-Install Graphviz first if needed:
+Install Python 3.14 and Graphviz first if needed:
 
 ```bash
 # macOS with Homebrew
-brew install graphviz
+brew install python@3.14 graphviz
 
-# Debian/Ubuntu Linux
+# Debian/Ubuntu Linux (Python 3.14 from python.org, your distribution or pyenv)
 sudo apt install graphviz
 ```
 
@@ -153,7 +155,7 @@ bash setup/setup_pip_mac.sh
 
 ### Windows
 
-Install Graphviz from [graphviz.org/download](https://graphviz.org/download/) first and make sure `dot.exe` is on your `PATH`.
+Install Python 3.14 from [python.org](https://www.python.org/downloads/) and Graphviz from [graphviz.org/download](https://graphviz.org/download/) first. Make sure `dot.exe` is on your `PATH`.
 
 Then open **Command Prompt** or **PowerShell**, navigate to the course folder, and run:
 
@@ -161,7 +163,27 @@ Then open **Command Prompt** or **PowerShell**, navigate to the course folder, a
 setup\setup_pip_windows.bat
 ```
 
-The pip setup does not use Conda or the `deitel-openai` conda environment. It creates a local `.venv` virtual environment and installs packages into that environment.
+The pip setup does not use Conda. It creates (or updates) a local `.venv` virtual environment in the course folder, installs packages into it and registers the `Python (deitel-openai-agents)` kernel. On Windows it uses the `py` launcher that the python.org installer provides, so it finds Python 3.14 even if a different `python` is first on your `PATH`.
+
+Rerun the same script at any time to update `.venv` to the course's current package versions. To register the kernel under a different name, pass it as the first argument:
+
+```bash
+bash setup/setup_pip_mac.sh my-kernel-name
+```
+
+```bat
+setup\setup_pip_windows.bat my-kernel-name
+```
+
+---
+
+## Checking Your Setup
+
+Each setup script ends by running `setup/check_setup.py`, which prints a pass/fail line for each requirement: Python version, packages, Graphviz, Playwright's Chromium, Google Chrome, microphone and speakers, and your API key. Run it again any time from the course folder with the course environment activated:
+
+```bash
+python setup/check_setup.py
+```
 
 ---
 
@@ -221,11 +243,11 @@ If you use a different shell startup file, update that file instead.
 ### Anaconda
 
 ```bash
-conda activate deitel-openai
+conda activate deitel-openai-agents
 jupyter lab
 ```
 
-If a notebook does not have a kernel selected, choose the **Python (deitel-openai)** kernel.
+If a notebook does not have a kernel selected, choose the **Python (deitel-openai-agents)** kernel.
 
 ### Python/pip on macOS / Linux
 
@@ -262,16 +284,9 @@ This demo runs an open-source LLM model locally rather than using a hosted OpenA
 
 **The model is approximately an 8 GB download so this is entirely optional.** The demo was tested on a MacBook Pro M2 Max with 96 GB of unified memory. On less powerful hardware, inference will be significantly slower and tool-calling reliability may vary.
 
-### Separate environment
+### LiteLLM is in the main environment
 
-Every current LiteLLM release requires `openai` 2.x, while the Agents SDK 0.22 used by the rest of this course requires `openai` 3.x. The two cannot share one environment, so `02-05-09` has its own environment and Jupyter kernel, **`deitel-openai-litellm`**. Create it once from the course folder after the main setup:
-
-* **Anaconda/macOS:** `bash setup/setup_litellm_mac.sh`
-* **Anaconda/Windows:** `setup\setup_litellm_windows.bat`
-* **pip/macOS or Linux:** `bash setup/setup_litellm_pip_mac.sh` (creates `.venv-litellm`)
-* **pip/Windows:** `setup\setup_litellm_pip_windows.bat` (creates `.venv-litellm`)
-
-Launch JupyterLab from the main course environment as usual. When you open `02-05-09`, choose **Kernel > Change Kernel... > Python (deitel-openai-litellm)**. Every other notebook keeps using the main kernel.
+The main setup scripts install LiteLLM, so `02-05-09` uses the same environment and kernel as every other notebook. LiteLLM 1.108.0 is the first release that works with the `openai` 3.x the Agents SDK requires (earlier releases required `openai` 2.x). Until 1.108.0 is released, the course pins its release candidate, `litellm==1.108.0rc1`.
 
 ### Ollama
 
@@ -307,7 +322,7 @@ The course setup installs everything else. End a session by saying "goodbye" or 
 
 **Graphviz `dot` not found** — Install Graphviz and make sure the `dot` command is on your `PATH`. The Anaconda setup installs Graphviz automatically; the `pip`/`venv` setup checks for it before creating the environment.
 
-**Playwright browser does not launch** — Run `playwright install chromium` again from the activated environment, then retry.
+**Playwright browser does not launch** — Run `python -m playwright install chromium` again from the activated environment, then retry.
 
 **`02-05-05` cannot connect to an MCP server** — That demo uses public, third-party MCP servers (`weather.chukai.io`, `geocoder.chukai.io` and `nws.caseyjhand.com`) that I do not control. If one is down or rate-limited, the demo fails until it is back; there is nothing to fix locally.
 
